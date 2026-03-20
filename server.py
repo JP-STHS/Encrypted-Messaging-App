@@ -1,43 +1,32 @@
 # =============================================================================
-# CYBERAPP  —  RELAY SERVER
+# CYBERAPP  —  RELAY SERVER  (Render-compatible)
 # =============================================================================
-# A lightweight WebSocket relay that connects CyberApp users over the internet.
+# Fix: Render's health checker sends HTTP HEAD/GET requests to verify the
+# service is alive. A pure WebSocket server rejects these, spamming errors.
+# Solution: use aiohttp which handles both HTTP health probes AND WebSocket
+# upgrades on the same port cleanly.
 #
-# The server is BLIND — it only sees encrypted binary blobs.
-# It cannot read any messages or files. All E2E encryption happens client-side.
+# ENDPOINTS:
+#   GET  /     → 200 OK  (Render health check)
+#   GET  /ws   → WebSocket upgrade (CyberApp clients connect here)
 #
-# HOW IT WORKS:
-#   1. Clients connect and announce their nickname
-#   2. Server broadcasts the peer list to everyone
-#   3. When client A wants to chat with client B, A sends a "relay" message
-#      addressed to B's connection ID — the server forwards it without reading it
-#   4. The ECDH handshake and AES-256-GCM encryption happen between the two
-#      clients; the server just moves the bytes
-#
-# DEPLOY FREE:
-#   Railway  → railway up  (add a Procfile: web: python server.py)
-#   Render   → connect GitHub repo, set start command: python server.py
-#   Fly.io   → fly launch, fly deploy
-#   Local    → python server.py  (then share your IP or use ngrok)
+# UPDATE cyberapp.py relay URL to end with /ws:
+#   wss://your-app.onrender.com/ws
 #
 # DEPENDENCIES:
-#   pip install websockets
-#
-# ENV VARS:
-#   PORT  — override default port 8765 (Render/Railway set this automatically)
+#   pip install aiohttp
 # =============================================================================
 
 import asyncio
 import json
 import os
 import time
-import websockets
-from websockets.server import WebSocketServerProtocol
+import aiohttp
+from aiohttp import web
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
-# conn_id → {"ws": websocket, "nickname": str, "joined": float}
-clients: dict[str, dict] = {}
+clients: dict = {}
 _id_counter = 0
 
 def _new_id() -> str:
@@ -47,109 +36,124 @@ def _new_id() -> str:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _send(ws: WebSocketServerProtocol, msg: dict):
-    try:
-        await ws.send(json.dumps(msg))
-    except Exception:
-        pass
-
 async def _broadcast_peer_list():
-    """Send the current peer list to every connected client."""
     peers = [
         {"id": cid, "nickname": info["nickname"]}
         for cid, info in clients.items()
     ]
-    msg = json.dumps({"type": "peer_list", "peers": peers})
+    msg  = json.dumps({"type": "peer_list", "peers": peers})
     dead = []
     for cid, info in list(clients.items()):
         try:
-            await info["ws"].send(msg)
+            await info["ws"].send_str(msg)
         except Exception:
             dead.append(cid)
     for cid in dead:
         clients.pop(cid, None)
 
-# ── Handler ───────────────────────────────────────────────────────────────────
+# ── WebSocket handler ─────────────────────────────────────────────────────────
 
-async def handle(ws: WebSocketServerProtocol):
+async def websocket_handler(request):
+    ws = web.WebSocketResponse(heartbeat=20)
+    await ws.prepare(request)
+
     conn_id  = _new_id()
     nickname = f"anon_{conn_id}"
     clients[conn_id] = {"ws": ws, "nickname": nickname, "joined": time.time()}
     print(f"[+] {conn_id} connected  (total: {len(clients)})")
 
-    # Tell the new client their assigned ID
-    await _send(ws, {"type": "welcome", "your_id": conn_id})
-    await _broadcast_peer_list()
-
     try:
-        async for raw in ws:
-            try:
-                # All control messages are JSON text frames
-                if isinstance(raw, str):
-                    msg = json.loads(raw)
-                    mtype = msg.get("type")
+        await ws.send_str(json.dumps({"type": "welcome", "your_id": conn_id}))
+        await _broadcast_peer_list()
 
-                    # ── announce: client sets their nickname ──
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    data  = json.loads(msg.data)
+                    mtype = data.get("type")
+
                     if mtype == "announce":
-                        nick = str(msg.get("nickname", nickname))[:32].strip()
+                        nick = str(data.get("nickname", nickname))[:32].strip()
                         if nick:
                             clients[conn_id]["nickname"] = nick
-                            print(f"    {conn_id} is now '{nick}'")
+                            print(f"    {conn_id} -> '{nick}'")
                             await _broadcast_peer_list()
 
-                    # ── relay_text: forward a JSON message to one peer ──
                     elif mtype == "relay_text":
-                        target_id = msg.get("to")
+                        target_id = data.get("to")
                         if target_id and target_id in clients:
                             fwd = {
-                                "type":    "relay_text",
-                                "from":    conn_id,
+                                "type":      "relay_text",
+                                "from":      conn_id,
                                 "from_nick": clients[conn_id]["nickname"],
-                                "payload": msg.get("payload"),
+                                "payload":   data.get("payload"),
                             }
-                            await _send(clients[target_id]["ws"], fwd)
+                            try:
+                                await clients[target_id]["ws"].send_str(json.dumps(fwd))
+                            except Exception:
+                                pass
 
-                    # ── ping: keepalive ──
                     elif mtype == "ping":
-                        await _send(ws, {"type": "pong"})
+                        await ws.send_str(json.dumps({"type": "pong"}))
 
-                # Binary frames = encrypted handshake / file data, relay as-is
-                elif isinstance(raw, bytes):
-                    # Format: 4-byte target_id_len + target_id + encrypted_blob
-                    if len(raw) < 5:
-                        continue
-                    tid_len = int.from_bytes(raw[:4], "big")
-                    if 4 + tid_len > len(raw):
-                        continue
-                    target_id   = raw[4:4 + tid_len].decode()
-                    blob        = raw[4 + tid_len:]
-                    if target_id in clients:
-                        # Prepend sender ID so receiver knows who it's from
-                        sid_bytes = conn_id.encode()
-                        frame     = len(sid_bytes).to_bytes(4, "big") + sid_bytes + blob
-                        try:
-                            await clients[target_id]["ws"].send(frame)
-                        except Exception:
-                            pass
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
-            except (json.JSONDecodeError, KeyError, ValueError):
-                pass
+            elif msg.type == aiohttp.WSMsgType.BINARY:
+                raw = msg.data
+                if len(raw) < 5:
+                    continue
+                tid_len   = int.from_bytes(raw[:4], "big")
+                if 4 + tid_len > len(raw):
+                    continue
+                target_id = raw[4:4 + tid_len].decode()
+                blob      = raw[4 + tid_len:]
+                if target_id in clients:
+                    sid_bytes = conn_id.encode()
+                    frame     = len(sid_bytes).to_bytes(4, "big") + sid_bytes + blob
+                    try:
+                        await clients[target_id]["ws"].send_bytes(frame)
+                    except Exception:
+                        pass
 
-    except websockets.exceptions.ConnectionClosed:
-        pass
+            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                break
+
     finally:
         clients.pop(conn_id, None)
         print(f"[-] {conn_id} disconnected  (total: {len(clients)})")
         await _broadcast_peer_list()
 
+    return ws
+
+# ── Health check (satisfies Render HEAD/GET probes) ───────────────────────────
+
+async def health_handler(request):
+    return web.Response(
+        text=f"CyberApp relay OK — {len(clients)} client(s) connected",
+        status=200
+    )
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
     port = int(os.environ.get("PORT", 8765))
-    print(f"CyberApp Relay Server  —  ws://0.0.0.0:{port}")
-    print("Waiting for clients…\n")
-    async with websockets.serve(handle, "0.0.0.0", port):
-        await asyncio.Future()  # run forever
+
+    app = web.Application()
+    app.router.add_get("/",   health_handler)    # Render health probe
+    app.router.add_get("/ws", websocket_handler) # CyberApp clients
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    print(f"CyberApp Relay Server — port {port}")
+    print(f"  Health : http://0.0.0.0:{port}/")
+    print(f"  WS     : ws://0.0.0.0:{port}/ws")
+    print("Waiting for clients...\n")
+
+    await asyncio.Future()  # run forever
 
 if __name__ == "__main__":
     asyncio.run(main())
