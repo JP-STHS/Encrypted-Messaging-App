@@ -47,9 +47,9 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# 🔧 CHANGE THIS to your deployed server URL, e.g.:
-#    "ws://your-app.railway.app"   or   "wss://your-app.onrender.com"
-#    Leave as "" to disable relay (LAN-only mode)
+#CHANGE THIS to your deployed server URL, e.g.:
+#"ws://your-app.railway.app/"   or   "wss://your-app.onrender.com/ws"
+#Leave as "" to disable relay (LAN-only mode)
 RELAY_URL = ""
 
 DARK_BG   = "#05053B"
