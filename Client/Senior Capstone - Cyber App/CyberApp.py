@@ -73,13 +73,14 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Crypto ────────────────────────────────────────────────────────────────────
 
+#create encrypted keys
 def generate_keypair():
     priv      = X25519PrivateKey.generate()
     pub_bytes = priv.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     )
     return priv, pub_bytes
-
+#refine the keys through a SHA256 hash
 def derive_session_key(private_key, peer_pub_bytes: bytes) -> bytes:
     peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
     shared   = private_key.exchange(peer_pub)
@@ -87,9 +88,9 @@ def derive_session_key(private_key, peer_pub_bytes: bytes) -> bytes:
         algorithm=hashes.SHA256(), length=32,
         salt=None, info=b"cyberapp-v3-session"
     ).derive(shared)
-
+#encrypt and decrpt each message
 def encrypt(key: bytes, plaintext: bytes) -> bytes:
-    nonce = secrets.token_bytes(12)
+    nonce = secrets.token_bytes(12) #generate 12 random bytes
     return nonce + AESGCM(key).encrypt(nonce, plaintext, None)
 
 def decrypt(key: bytes, data: bytes) -> bytes:
@@ -98,14 +99,14 @@ def decrypt(key: bytes, data: bytes) -> bytes:
 
 # ── Helper ────────────────────────────────────────────────────────────────────
 
-def center_window(window):
+def center_window(window): #center a window when called
     window.update_idletasks()
     w, h = window.winfo_width(), window.winfo_height()
     sw, sh = window.winfo_screenwidth(), window.winfo_screenheight()
     window.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
 
-# ── LAN Discovery (unchanged) ─────────────────────────────────────────────────
+# ── LAN Discovery ─────────────────────────────────────────────────
 
 class PeerDiscovery:
     def __init__(self, nickname, pub_bytes, on_peer_found, on_peer_lost, log=None):
@@ -120,7 +121,6 @@ class PeerDiscovery:
         self.log           = log
 
     def _get_network_info(self):
-        import ipaddress
         local_ips   = {"127.0.0.1"}
         bcast_addrs = []
         try:
